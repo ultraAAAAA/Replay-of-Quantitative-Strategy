@@ -1,0 +1,93 @@
+#原始策略：兴业证券2019-12-05发布的报告《基于熵测度的股票收益非对称性因子研究》
+#实现平台：WindQuant
+
+
+# 导入模块
+from WindPy import *                 # 导入提取数据的 API接口，必导入！！！
+w.start(show_welcome=False)      # 启动 API 接口，必导入！！！
+from WindAlgo import *              # 导入回测框架，必导入！！！
+import WindAlpha as windalpha    # 导入因子分析框架，必导入！！！
+from datetime import *        
+import pandas as pd
+import statsmodels.api as sm
+import math
+import sklearn
+from scipy import spatial
+from sklearn.neighbors import KernelDensity
+import matplotlib.pyplot as plt
+import mpl_toolkits.mplot3d
+from sklearn import preprocessing
+from scipy import integrate
+import datetime
+
+
+#第一步，获取回测当天的日期
+#date = bar_datetime.strftime('%Y-%m-%d')   # 日期可自行设置（可修改）
+date = '2018-06-12'
+new_date = datetime.datetime.strptime(date,'%Y-%m-%d')
+
+#第二步，获取回测当天前九十天的日期,因子一个月构造一次，构造因子所用的时间区间为3个月
+offset = datetime.timedelta(days=-90)
+previous_date = (new_date + offset).strftime('%Y-%m-%d')
+
+#第三步，获取股票列表
+stocks = w.wset("sectorconstituent","date="+date+";windcode=000906.SH;field=wind_code")  # ★★★ 行代码请勿修改！，否则将取消策略成绩！！！（其中date变量命名可依据92行日期变量名而定）★★★
+assert stocks.ErrorCode == 0, "API（wset）数据提取失败，ErrorCode={}，含义为{}。".format(stocks.ErrorCode, stocks.Data[0]) # API数据提取异常处理
+stks_list = stocks.Data[0]
+#准备好my_factor的结构
+error,data = w.wss(stks_list, "val_pe_deducted_ttm","tradeDate="+date+";unit=1",usedf=True)
+assert error == 0, "API（wss）数据提取失败，ErrorCode={}，含义为{}。".format(error, data.values[0]) # API数据提取异常处理
+data = data.rename(columns={'VAL_PE_DEDUCTED_TTM':'my_factor'})
+data['my_factor'] = None
+
+
+#第四步，准备好计算因子时需要用到的函数
+def ked(z):
+    return ((1/math.sqrt(2*math.pi))*math.exp(-math.pow(z,2)))
+
+def sigma_function(x,y):
+    return sum(current_data.apply(lambda k: ked((k[0]-x)/h1)*ked((k[1]-y)/h2),axis=1))/(len(current_data)*h1*h2)
+
+def relative_entropy(x,y):
+    return 0.5*(math.pow((math.sqrt(sigma_function(x,y))-math.sqrt(sigma_function(-x,-y))),2))
+    
+    
+#第五步,获取回测当天的市场数据,这个放在循环外，这个是每支股票都需要用到的！
+factors="close" 
+error,market_data=w.wsd('000906.SH',factors,previous_date,date, "PriceAdj=F",usedf=True)
+#修改列名
+market_data = market_data.rename(columns={'CLOSE':'market_close'})
+#计算收益率并标准化收益率
+market_data['market_return'] = preprocessing.scale(market_data['market_close'].pct_change())
+#去掉第一行
+market_data = market_data.drop(index = market_data.index[0])
+
+
+#第六步，循环每支股票，计算其相应的因子值
+for i in range(2):
+#for i in range(len(stk_list)):
+    #下载相应的个股数据
+    error,stock_data=w.wsd(stks_list[i],factors,previous_date,date, "PriceAdj=F",usedf=True)
+    assert error == 0, "API数据提取错误，ErrorCode={}，具体含义请至帮助文档附件《常见API错误码》中查询。".format(error)  # API异常处理
+    #修改个股数据列名
+    stock_data = stock_data.rename(columns={'CLOSE':'stock_close'})
+    #计算个股收益率并标准化收益率
+    stock_data['stock_return'] = preprocessing.scale(stock_data['stock_close'].pct_change())
+    #去掉第一行
+    stock_data = stock_data.drop(index = stock_data.index[0])
+    #合并个股数据和和市场数据(为了之后调用函数而合并的，不合并也可以，只需在sigma_function那里做相应调整就可以，不过问题不大)
+    current_data = pd.concat([stock_data.loc[:,'stock_return'],market_data.loc[:,'market_return']],axis = 1)
+    
+    #确定二元核密度估计的两个最优带宽参数，计算最优带宽参数使用的似然交叉验证方法
+    c1 = pd.DataFrame(current_data.iloc[:,0]).values
+    c2 = pd.DataFrame(current_data.iloc[:,1]).values
+    density = sm.nonparametric.KDEMultivariate(data=[c1,c2], var_type='cc', bw = 'cv_ml')
+    h1 = density.bw[0]
+    h2 = density.bw[1]
+    
+    #计算个股的Sp,DP,UP,然后确定每个股票最终的ASY因子值
+    Sp,err1 = integrate.dblquad(relative_entropy,0.5,np.inf,lambda g:0.5,lambda g:np.inf)
+    DP,err2 = integrate.dblquad(sigma_function,-np.inf,-0.5,lambda g:-np.inf,lambda g:-0.5)
+    UP,err3 = integrate.dblquad(sigma_function,0.5,np.inf,lambda g:0.5,lambda g:np.inf)
+    data.iloc[i,0] = np.sign(DP- UP)*Sp
+my_factor = data
